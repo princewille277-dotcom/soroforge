@@ -98,6 +98,101 @@ func TestSoroVaultInterface(t *testing.T) {
 	require.Len(t, in.Events, 1)
 }
 
+func TestSoroVaultInterfaceEdgeCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		baseURL    func(base string) string
+		contractID string
+		wasmHash   string
+		ctx        func() (context.Context, context.CancelFunc)
+		handler    http.HandlerFunc
+		check      func(t *testing.T, iface *Interface, err error)
+	}{
+		{
+			name:       "empty interface payload decodes with empty fields",
+			contractID: readerContractID,
+			wasmHash:   "empty",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/api/contracts/"+readerContractID, r.URL.Path)
+				assert.Equal(t, "empty", r.URL.Query().Get("wasm_hash"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"contract_id":"` + readerContractID + `","wasm_hash":"empty","current":false,"interface":{"functions":[],"types":{"structs":[],"unions":[],"enums":[],"error_enums":[]},"events":[]}}`))
+			},
+			check: func(t *testing.T, iface *Interface, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, iface)
+				assert.Empty(t, iface.Functions)
+				assert.Empty(t, iface.Events)
+				assert.Empty(t, iface.Types.Structs)
+				assert.Empty(t, iface.Types.Unions)
+				assert.Empty(t, iface.Types.Enums)
+				assert.Empty(t, iface.Types.ErrorEnums)
+			},
+		},
+		{
+			name: "boundary baseURL with trailing slashes and escaped query wasm hash",
+			baseURL: func(base string) string {
+				return base + "///"
+			},
+			contractID: readerContractID,
+			wasmHash:   "hash with spaces & symbols+v1",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/api/contracts/"+readerContractID, r.URL.Path)
+				assert.Equal(t, "hash with spaces & symbols+v1", r.URL.Query().Get("wasm_hash"))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"interface":{"functions":[{"name":"init","inputs":[],"outputs":[]}]}}`))
+			},
+			check: func(t *testing.T, iface *Interface, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, iface)
+				require.Len(t, iface.Functions, 1)
+				assert.Equal(t, "init", iface.Functions[0].Name)
+			},
+		},
+		{
+			name:       "invalid input with canceled context returns error",
+			contractID: readerContractID,
+			wasmHash:   "3f2a",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, cancel
+			},
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			},
+			check: func(t *testing.T, iface *Interface, err error) {
+				require.Error(t, err)
+				assert.Nil(t, iface)
+				assert.ErrorContains(t, err, "context canceled")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			t.Cleanup(srv.Close)
+
+			baseURL := srv.URL
+			if tc.baseURL != nil {
+				baseURL = tc.baseURL(srv.URL)
+			}
+
+			ctx := context.Background()
+			if tc.ctx != nil {
+				var cancel context.CancelFunc
+				ctx, cancel = tc.ctx()
+				defer cancel()
+			}
+
+			sv := NewSoroVault(nil)
+			iface, err := sv.Interface(ctx, baseURL, tc.contractID, tc.wasmHash)
+			tc.check(t, iface, err)
+		})
+	}
+}
+
 func TestParamJSONRoundTrip(t *testing.T) {
 	orig := Param{Name: "amount", Type: Type{Display: "u128"}}
 	b, err := json.Marshal(orig)
